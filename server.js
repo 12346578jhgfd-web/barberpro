@@ -217,6 +217,31 @@ A.post('/:id/cancelar', wrap((req, res) => {
   db.prepare("UPDATE appointments SET status='cancelado' WHERE id=? AND status='agendado'").run(req.params.id);
   res.json({ ok: 1 });
 }));
+// Cancelar TODOS os agendamentos pendentes (só admin/gerente).
+// Se vier "todas":true cancela de todas as datas; senão, só da data enviada.
+// Atendimentos já concluídos NÃO são mexidos (a receita deles já está no caixa).
+A.post('/cancelar-todos', need('admin', 'gerente'), wrap((req, res) => {
+  const r = req.body.todas
+    ? db.prepare("UPDATE appointments SET status='cancelado' WHERE status='agendado'").run()
+    : db.prepare("UPDATE appointments SET status='cancelado' WHERE status='agendado' AND date=?").run(req.body.date || now().slice(0, 10));
+  res.json({ cancelados: r.changes });
+}));
+// Cancelar atendimentos JÁ CONCLUÍDOS (só admin/gerente).
+// Para o caixa não ficar com dinheiro de um serviço cancelado, cada um gera um
+// ESTORNO (despesa do mesmo valor) no caixa aberto. Tudo ou nada (transaction).
+A.post('/cancelar-concluidos', need('admin', 'gerente'), wrap((req, res) => {
+  const cx = openCash();
+  if (!cx) return bad(res, 'Abra o caixa para registrar os estornos');
+  const lista = req.body.todas
+    ? db.prepare("SELECT a.id, a.price, s.name FROM appointments a JOIN services s ON s.id=a.service_id WHERE a.status='concluido'").all()
+    : db.prepare("SELECT a.id, a.price, s.name FROM appointments a JOIN services s ON s.id=a.service_id WHERE a.status='concluido' AND a.date=?").all(req.body.date || now().slice(0, 10));
+  db.transaction(() => lista.forEach(a => {
+    db.prepare("UPDATE appointments SET status='cancelado' WHERE id=?").run(a.id);
+    db.prepare("INSERT INTO cash(session_id,type,description,amount,created_at,appointment_id) VALUES(?,?,?,?,?,?)")
+      .run(cx.id, 'despesa', 'Estorno: ' + a.name + ' (cancelado)', a.price, now(), a.id);
+  }))();
+  res.json({ cancelados: lista.length });
+}));
 // Concluir atendimento = marca como feito + lança a RECEITA no caixa (tudo ou nada)
 A.post('/:id/concluir', wrap((req, res) => {
   const a = db.prepare('SELECT a.*, s.name sname FROM appointments a JOIN services s ON s.id=a.service_id WHERE a.id=?').get(req.params.id);
@@ -234,7 +259,7 @@ app.use('/api/agenda', A);
 
 // ---------- 8. PAINEL / RELATÓRIOS ----------
 app.get('/api/dashboard', need('admin', 'gerente'), wrap((req, res) => {
-  const mes = now().slice(0, 7) + '%', hoje = now().slice(0, 10);
+  const mes = (/^\d{4}-\d{2}$/.test(req.query.mes) ? req.query.mes : now().slice(0, 7)) + '%', hoje = now().slice(0, 10);
   const soma = t => db.prepare("SELECT COALESCE(SUM(amount),0) v FROM cash WHERE type=? AND created_at LIKE ?").get(t, mes).v;
   res.json({
     hoje: db.prepare("SELECT COUNT(*) n FROM appointments WHERE date=? AND status!='cancelado'").get(hoje).n,
@@ -243,8 +268,37 @@ app.get('/api/dashboard', need('admin', 'gerente'), wrap((req, res) => {
       FROM appointments a JOIN professionals p ON p.id=a.professional_id
       WHERE a.status='concluido' AND a.date LIKE ? GROUP BY p.id`).all(mes),
     top: db.prepare(`SELECT s.name, COUNT(*) n, SUM(a.price) total FROM appointments a JOIN services s ON s.id=a.service_id
-      WHERE a.status='concluido' AND a.date LIKE ? GROUP BY s.id ORDER BY n DESC LIMIT 5`).all(mes),
+      WHERE a.status='concluido' AND a.date LIKE ? GROUP BY s.id ORDER BY n DESC`).all(mes),
   });
+}));
+
+// ---------- 8.1 DOWNLOAD DE RELATÓRIOS (arquivo CSV, abre no Excel) ----------
+// Uso: /api/relatorio/financeiro?de=2026-10-01&ate=2026-10-31
+const csvCell = v => {
+  let s = typeof v === 'number' ? String(v).replace('.', ',') : String(v ?? '');
+  if (/^[=+\-@]/.test(s)) s = "'" + s;           // evita "injeção de fórmula" no Excel
+  return '"' + s.replace(/"/g, '""') + '"';
+};
+const REL = {
+  // Serviços feitos (concluídos) agrupados por mês: quantidade e total
+  servicos_mensal: { titulo: 'Mês;Serviço;Quantidade;Total', sql: `SELECT substr(a.date,1,7), s.name, COUNT(*), SUM(a.price)
+    FROM appointments a JOIN services s ON s.id=a.service_id WHERE a.status='concluido' AND a.date BETWEEN ? AND ?
+    GROUP BY substr(a.date,1,7), s.id ORDER BY 1, 3 DESC` },
+  financeiro: { titulo: 'Data;Tipo;Descrição;Valor', sql: `SELECT created_at, type, description, amount FROM cash
+    WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY created_at` },
+  atendimentos: { titulo: 'Data;Hora;Cliente;Profissional;Serviço;Valor;Status', sql: `SELECT a.date, a.time, c.name, p.name, s.name, a.price, a.status
+    FROM appointments a JOIN clients c ON c.id=a.client_id JOIN professionals p ON p.id=a.professional_id
+    JOIN services s ON s.id=a.service_id WHERE a.date BETWEEN ? AND ? ORDER BY a.date, a.time` },
+};
+app.get('/api/relatorio/:tipo', need('admin', 'gerente'), wrap((req, res) => {
+  const rel = REL[req.params.tipo];
+  if (!rel) return bad(res, 'Relatório inexistente');
+  const de = req.query.de || '2000-01-01', ate = req.query.ate || '2999-12-31';
+  const linhas = db.prepare(rel.sql).raw().all(de, ate);   // raw() = cada linha vira uma lista
+  const csv = '\ufeff' + [rel.titulo, ...linhas.map(l => l.map(csvCell).join(';'))].join('\r\n');
+  res.set({ 'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${req.params.tipo}_${de}_a_${ate}.csv"` });
+  res.send(csv);
 }));
 
 // ---------- 9. LIGAR O SERVIDOR ----------
