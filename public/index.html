@@ -38,6 +38,9 @@ dialog{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-
 dialog::backdrop{background:#0009}
 .row{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
 .login{max-width:340px;margin:12vh auto;padding:24px;display:flex;flex-direction:column;gap:12px;background:var(--card);border-radius:14px}
+/* ===== IMPRESSÃO: ao imprimir/salvar em PDF, some o menu e fica fundo branco ===== */
+@media print{body{background:#fff;color:#000}nav,.tools,.noprint{display:none}main{margin:0;padding:0}
+ .card,table{background:#fff;color:#000}.card b{color:#000}th,td{border-color:#999}}
 /* ===== CELULAR (telas até 768px) ===== */
 @media(max-width:768px){
  nav{top:auto;width:auto;left:0;right:0;flex-direction:row;overflow-x:auto;padding:6px;z-index:5}
@@ -61,6 +64,7 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); // evita injeção de código
 const brl = n => Number(n || 0).toLocaleString('pt-BR', {style:'currency', currency:'BRL'});
 let me = null, page = 'painel', Q = '', CUR = {};
+let MES = new Date().toLocaleDateString('en-CA').slice(0, 7); // mês mostrado no Painel (AAAA-MM)
 let DATE = new Date().toLocaleDateString('en-CA'); // data de hoje (AAAA-MM-DD)
 
 // ---- Fala com o servidor. Se der erro, lança a mensagem dele ----
@@ -137,11 +141,17 @@ P.servicos = () => simple('servicos', 'Serviço', [{k:'name', l:'Nome'}, {k:'pri
 
 // Painel com indicadores
 P.painel = async () => {
-  const d = await api('dashboard');
-  return head('Painel') + `<div class="cards">${[['Atendimentos hoje', d.hoje], ['Receitas do mês', brl(d.receita)], ['Despesas do mês', brl(d.despesa)], ['Saldo do mês', brl(d.receita - d.despesa)]]
+  const d = await api('dashboard?mes=' + MES);
+  return head('Painel') + `<div class="noprint"><h3>Relatórios</h3>
+   <div class="tools"><label>Mês do relatório <input type="month" value="${MES}" onchange="MES=this.value||MES;render()"></label>
+   <button onclick="baixarMes()">⬇ Serviços do mês (CSV)</button></div><br>
+   <div class="tools"><input type="date" id="de" title="De"><input type="date" id="ate" title="Até">
+   <button onclick="baixar('financeiro')">⬇ Financeiro (CSV)</button><button onclick="baixar('atendimentos')">⬇ Atendimentos (CSV)</button>
+   <button class="ghost" onclick="window.print()">🖨 Imprimir / PDF</button></div>
+   <p class="mut">Deixe as datas vazias para baixar tudo. O arquivo CSV abre no Excel.</p></div><div class="cards">${[['Atendimentos hoje', d.hoje], ['Receitas do mês', brl(d.receita)], ['Despesas do mês', brl(d.despesa)], ['Saldo do mês', brl(d.receita - d.despesa)]]
     .map(c => `<div class="card"><small>${c[0]}</small><b>${c[1]}</b></div>`).join('')}</div>
-   <h3>Comissões do mês</h3>` + table([['name','Profissional'], ['n','Atendimentos'], ['total','Faturado',r => brl(r.total)], ['comissao','Comissão',r => brl(r.comissao)]], d.comissoes, () => '') +
-   '<h3>Serviços mais feitos</h3>' + table([['name','Serviço'], ['n','Qtd'], ['total','Total',r => brl(r.total)]], d.top, () => '');
+   <h3>Comissões em ${MES}</h3>` + table([['name','Profissional'], ['n','Atendimentos'], ['total','Faturado',r => brl(r.total)], ['comissao','Comissão',r => brl(r.comissao)]], d.comissoes, () => '') +
+   `<h3>Serviços feitos em ${MES}</h3>` + table([['name','Serviço'], ['n','Qtd'], ['total','Total',r => brl(r.total)]], d.top, () => '');
 };
 
 // Agenda do dia
@@ -149,7 +159,7 @@ P.agenda = async () => {
   const [rows, cl, pr, sv] = await Promise.all([api('agenda?date=' + DATE), api('clientes'), api('profissionais'), api('servicos')]);
   CUR = {rows, cl, pr, sv};
   const st = {agendado:'', concluido:'<span class="b grn">Concluído</span>', cancelado:'<span class="b red">Cancelado</span>'};
-  return head('Agenda', `<input type="date" value="${DATE}" onchange="DATE=this.value;render()"><button onclick="novoAg()">+ Agendar</button>`) +
+  return head('Agenda', `<input type="date" value="${DATE}" onchange="DATE=this.value;render()"><button onclick="novoAg()">+ Agendar</button>${GER.includes(me.role) ? `<button class="ghost red" onclick="cancelarTodos(false)">Cancelar todos do dia</button><button class="ghost red" onclick="cancelarTodos(true)">Cancelar todos (todas as datas)</button><button class="ghost red" onclick="cancelarConcluidos(false)">Cancelar concluídos do dia</button><button class="ghost red" onclick="cancelarConcluidos(true)">Cancelar concluídos (todas as datas)</button>` : ''}`) +
     table([['time','Hora'], ['client','Cliente'], ['professional','Profissional'], ['service','Serviço'], ['price','Valor',r => brl(r.price)], ['status','Status',r => st[r.status]]], rows,
       r => r.status === 'agendado' ? `<button onclick="run(()=>api('agenda/${r.id}/concluir','POST'))">Concluir</button><button class="ghost red" onclick="confirm('Cancelar?')&&run(()=>api('agenda/${r.id}/cancelar','POST'))">Cancelar</button>` : '');
 };
@@ -158,6 +168,22 @@ const novoAg = () => openForm('Novo agendamento', [
   {k:'professional_id', l:'Profissional', t:'select', o:CUR.pr.map(x => [x.id, x.name])},
   {k:'service_id', l:'Serviço', t:'select', o:CUR.sv.map(x => [x.id, x.name + ' - ' + brl(x.price)])},
   {k:'date', l:'Data', t:'date'}, {k:'time', l:'Hora', t:'time'}], {date:DATE}, o => api('agenda', 'POST', o));
+
+// Baixar relatório: abre o endereço do servidor, o navegador baixa o arquivo
+const baixar = tipo => { window.location = `/api/relatorio/${tipo}?de=${$('#de').value}&ate=${$('#ate').value}`; };
+// Relatório mensal de serviços: o mês escolhido vira data inicial e final
+const baixarMes = () => { window.location = `/api/relatorio/servicos_mensal?de=${MES}-01&ate=${MES}-31`; };
+// Cancelar todos os agendamentos pendentes (do dia mostrado ou de todas as datas)
+const cancelarTodos = todas => {
+  if (!confirm(todas ? 'Cancelar TODOS os agendamentos pendentes de TODAS as datas?' : 'Cancelar todos os agendamentos pendentes do dia ' + DATE + '?')) return;
+  run(async () => { const r = await api('agenda/cancelar-todos', 'POST', {todas, date: DATE}); alert(r.cancelados + ' agendamento(s) cancelado(s).'); });
+};
+
+// Cancelar atendimentos CONCLUÍDOS: o servidor lança estornos no caixa aberto
+const cancelarConcluidos = todas => {
+  if (!confirm((todas ? 'Cancelar TODOS os atendimentos concluídos de TODAS as datas?' : 'Cancelar os atendimentos concluídos do dia ' + DATE + '?') + '\nSerá lançado um estorno no caixa para cada um.')) return;
+  run(async () => { const r = await api('agenda/cancelar-concluidos', 'POST', {todas, date: DATE}); alert(r.cancelados + ' atendimento(s) cancelado(s) e estornado(s).'); });
+};
 
 // Caixa
 P.caixa = async () => {
